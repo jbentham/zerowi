@@ -1,0 +1,2 @@
+python alpha_speedup.py -c /dev/ttyUSB0 -b 460800
+arm-none-eabi-gdb -x run_lin.gdb zerowi.elf
