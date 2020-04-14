@@ -20,92 +20,149 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "whd_types.h"
+#include "whd_wlioctl.h"
+#include "whd_events.h"
+
 #include "zw_sdio.h"
 #include "zw_regs.h"
 #include "zw_ioctl.h"
 #include "zw_gpio.h"
 
+#define IOCTL_POLL_MSEC     2
+
 IOCTL_MSG ioctl_txmsg, ioctl_rxmsg;
 int txglom;
 uint16_t ioctl_reqid=0;
+uint8_t event_mask[EVENT_MAX / 8];
+EVT_STR *current_evts;
+char ioctl_event_hdr_fields[] =  
+    "2:len 2: 1:seq 1:chan 1: 1:hdrlen 1:flow 1:credit";
+#define MAX_EVENT_STATUS 16
+char *event_status[MAX_EVENT_STATUS] = {
+    "SUCCESS","FAIL","TIMEOUT","NO_NETWORK","ABORT","NO_ACK",
+    "UNSOLICITED","ATTEMPT","PARTIAL","NEWSCAN","NEWASSOC",
+    "11HQUIET","SUPPRESS","NOCHANS","CCXFASTRM","CS_ABORT" };
 
-char ioctl_cmd_fields[] =  "1:seq\0" "1:chan\0" "1:nextlen\0" "1:hdrlen\0"
-                           "1:flow\0" "1:credit\0" "1:\0" "1:\0"
-                           "4:cmd\0" "2:outlen\0" "2:inlen\0"
-                           "4:flags\0" "4:status\0" "";
-
-// Get event data
-int ioctl_get_event(uint8_t *data, int maxlen)
+// Get event data, return data length excluding header
+int ioctl_get_event(IOCTL_EVENT_HDR *hp, uint8_t *data, int maxlen)
 {
-    IOCTL_EVENT_HDR hdr={0};
-    int n=0, dlen;
+    int n=0, dlen=0, blklen;
 
-    if (sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)&hdr, sizeof(IOCTL_EVENT_HDR)) &&
-        hdr.len>0 && hdr.notlen>0 && hdr.len==(hdr.notlen^0xffff))
+    hp->len = 0;
+    if (sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)hp, sizeof(IOCTL_EVENT_HDR)) &&
+        hp->len>sizeof(IOCTL_EVENT_HDR) && hp->notlen>0 && hp->len==(hp->notlen^0xffff))
     {
-        while (n<hdr.len && n<maxlen)
+        dlen = hp->len - sizeof(IOCTL_EVENT_HDR);
+        while (n<dlen && n<maxlen)
         {
-            dlen = MIN(MIN(maxlen-n, hdr.len-n), IOCTL_MAX_DLEN);
-            sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)(&data[n]), dlen);
-            n += dlen;
+            blklen = MIN(MIN(maxlen-n, hp->len-n), IOCTL_MAX_BLKLEN);
+            sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)(&data[n]), blklen);
+            n += blklen;
         }
-        while (n < hdr.len)
+        while (n < dlen)
         {
-            dlen = MIN(hdr.len-n, IOCTL_MAX_DLEN);
-            sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, 0, dlen);
-            n += dlen;
+            blklen = MIN(hp->len-n, IOCTL_MAX_BLKLEN);
+            sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, 0, blklen);
+            n += blklen;
         }
     }
-    return(n);
+    return(dlen > maxlen ? maxlen : dlen);
 }
 
-// Get an IOCTL variable
-int ioctl_getvar(char *name, uint8_t *data, int dlen)
+// Enable events
+int ioctl_enable_evts(EVT_STR *evtp)
 {
-    return(ioctl_cmd(0, IOCTL_GETVAR, name, data, dlen));
+    current_evts = evtp;
+    memset(event_mask, 0, sizeof(event_mask));
+    while (evtp->num >= 0)
+    {
+        if (evtp->num / 8 < sizeof(event_mask))
+            SET_EVENT(event_mask, evtp->num);
+        evtp++;
+    }
+    return(ioctl_set_data("event_msgs", 0, event_mask, sizeof(event_mask)));
 }
 
-// Set an integer IOCTL variable
-int ioctl_set_uint32(char *name, uint32_t val)
+// Return string corresponding to event number, without "WLC_E_" prefix
+char *ioctl_evt_str(int event)
+{
+    EVT_STR *evtp=current_evts;
+
+    while (evtp && evtp->num>=0 && evtp->num!=event)
+        evtp++;
+    return(evtp && evtp->num>=0 && strlen(evtp->str)>6 ? &evtp->str[6] : "?");
+}
+
+// Return string corresponding to event status
+char *ioctl_evt_status_str(int status)
+{
+    return(status>=0 && status<MAX_EVENT_STATUS ? event_status[status] : "?");
+}
+
+// Get data block from IOCTL variable
+int ioctl_get_data(char *name, int wait_msec, uint8_t *data, int dlen)
+{
+    return(ioctl_cmd(WLC_GET_VAR, name, wait_msec, 0, data, dlen));
+}
+
+// Set data block in IOCTL variable
+int ioctl_set_data(char *name, int wait_msec, void *data, int len)
+{
+    return(ioctl_cmd(WLC_SET_VAR, name, wait_msec, 1, data, len));
+}
+
+// Set an unsigned integer IOCTL variable
+int ioctl_set_uint32(char *name, int wait_msec, uint32_t val)
 {
     U32DATA u32 = {.uint32=val};
 
-    return(ioctl_cmd(1, IOCTL_SETVAR, name, u32.bytes, 4));
+    return(ioctl_cmd(WLC_SET_VAR, name, wait_msec, 1, u32.bytes, 4));
 }
 
-// Set an IOCTL variable with data value
-int ioctl_set_data(char *name, void *data, int len)
+// Set 2 integers in IOCTL variable
+int ioctl_set_intx2(char *name, int wait_msec, int val1, int val2)
 {
-    return(ioctl_cmd(1, IOCTL_SETVAR, name, data, len));
+    int data[2] = {val1, val2};
+
+    return(ioctl_cmd(WLC_SET_VAR, name, wait_msec, 1, data, 8));
 }
 
 // IOCTL write with integer parameter
-int ioctl_cmd_int32(int cmd, int val)
+int ioctl_wr_int32(int cmd, int wait_msec, int val)
 {
     U32DATA u32 = {.uint32=(uint32_t)val};
 
-    return(ioctl_cmd(1, cmd, 0, u32.bytes, 4));
+    return(ioctl_cmd(cmd, 0, wait_msec, 1, u32.bytes, 4));
 }
 
-// IOCTL write with data
-int ioctl_cmd_data(int cmd, void *data, int len)
+// IOCTL write data
+int ioctl_wr_data(int cmd, int wait_msec, void *data, int len)
 {
-    return(ioctl_cmd(1, cmd, 0, data, len));
+    return(ioctl_cmd(cmd, 0, wait_msec, 1, data, len));
 }
 
-// Do an IOCTL transaction
-int ioctl_cmd(int wr, int cmd, char *name, void *data, int dlen)
+// IOCTL read data
+int ioctl_rd_data(int cmd, int wait_msec, void *data, int len)
+{
+    return(ioctl_cmd(cmd, 0, wait_msec, 0, data, len));
+}
+
+// Do an IOCTL transaction, get response, optionally waiting for it
+int ioctl_cmd(int cmd, char *name, int wait_msec, int wr, void *data, int dlen)
 {
     static uint8_t txseq=1;
-    IOCTL_MSG *msgp = &ioctl_txmsg;
+    IOCTL_MSG *msgp = &ioctl_txmsg, *rsp = &ioctl_rxmsg;
     IOCTL_CMD *cmdp = txglom ? &msgp->glom_cmd.cmd : &msgp->cmd;
     int ret=0, namelen = name ? strlen(name)+1 : 0;
     int txdlen = wr ? namelen + dlen : MAX(namelen, dlen);
     int hdrlen = cmdp->data - (uint8_t *)&ioctl_txmsg;
-    int txlen = ((hdrlen + txdlen + 3) / 4) * 4;
-    uint32_t val;
+    int txlen = ((hdrlen + txdlen + 3) / 4) * 4; //, rxlen;
+    uint32_t val=0;
 
+    // Prepare IOCTL command
     memset(msgp, 0, sizeof(ioctl_txmsg));
+    memset(rsp, 0, sizeof(ioctl_rxmsg));
     msgp->notlen = ~(msgp->len = hdrlen+txdlen);
     if (txglom)
     {
@@ -121,17 +178,37 @@ int ioctl_cmd(int wr, int cmd, char *name, void *data, int dlen)
         memcpy(cmdp->data, name, namelen);
     if (wr)
         memcpy(&cmdp->data[namelen], data, dlen);
+    // Send IOCTL command
     sdio_cmd53_write(SD_FUNC_RAD, SB_32BIT_WIN, (void *)msgp, txlen);
     ioctl_wait(IOCTL_WAIT_USEC);
-    sdio_bak_read32(SB_INT_STATUS_REG, &val);
-    if (val & 0xff)
+    while (wait_msec>=0 && ret==0)
     {
-        sdio_bak_write32(SB_INT_STATUS_REG, val);
-        ret = sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)&ioctl_rxmsg, txlen);
-        if (ioctl_rxmsg.cmd.flags >> 16 != ioctl_reqid)
-            ret = 0;
-        else if (!wr && data && dlen)
-            memcpy(data, ioctl_rxmsg.cmd.data, dlen);
+        // Wait for response to be available
+        wait_msec -= IOCTL_POLL_MSEC;
+        sdio_bak_read32(SB_INT_STATUS_REG, &val);
+        // If response is waiting..
+        if (val & 0xff)
+        {
+            // ..request response
+            sdio_bak_write32(SB_INT_STATUS_REG, val);
+            // Fetch response
+            ret = sdio_cmd53_read(SD_FUNC_RAD, SB_32BIT_WIN, (void *)rsp, txlen);
+            // Discard response if not matching request
+            if ((rsp->cmd.flags>>16) != ioctl_reqid)
+                ret = 0;
+            // Exit if error response
+            if (ret && (rsp->cmd.flags & 1))
+            {
+                ret = 0;
+                break;
+            }
+            // If OK, copy data to buffer
+            if (ret && !wr && data && dlen)
+                memcpy(data, rsp->cmd.data, dlen);
+        }
+        // If no response, wait
+        else
+            usdelay(IOCTL_POLL_MSEC * 1000);
     }
     return(ret);
 }
@@ -151,6 +228,47 @@ int ioctl_wait(int usec)
 int ioctl_ready(void)
 {
     return(!gpio_in(SD_D1_PIN));
+}
+
+// Display fields in structure
+// Fields in descriptor are num:id (little-endian) or num;id (big_endian)
+void disp_fields(void *data, char *fields, int maxlen)
+{
+    char *strs=fields, delim=0;
+    uint8_t *dp = (uint8_t *)data;
+    int n, dlen;
+    int val;
+    
+    while (*strs && dp-(uint8_t *)data<maxlen)
+    {
+        dlen = 0;
+        while (*strs>='0' && *strs<='9')
+            dlen = dlen*10 + *strs++ - '0';
+        delim = *strs++;
+        if (*strs > ' ')
+        {
+            while (*strs >= '0')
+                putchar(*strs++);
+            putchar('=');
+            if (dlen <= 4)
+            {
+                val = 0;
+                for (n=0; n<dlen; n++)
+                    val |= (uint32_t)(*dp++) << ((delim==':' ? n : dlen-n-1) * 8);
+                printf("%02X ", val);
+            }
+            else
+            {
+                for (n=0; n<dlen; n++)
+                    printf("%02X", *dp++);
+                putchar(' ');
+            }
+        }
+        else
+            dp += dlen;
+        while (*strs == ' ')
+            strs++;
+    }
 }
 
 

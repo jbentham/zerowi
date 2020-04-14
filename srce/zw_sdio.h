@@ -149,6 +149,7 @@ typedef union
 // Union to handle 8/16/32 bit conversions
 typedef union
 {
+    int32_t  int32;
     uint32_t uint32;
     uint32_t uint24:24;
     uint16_t uint16;
